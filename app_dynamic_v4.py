@@ -8,304 +8,328 @@ Created on Wed Nov 12 22:15:06 2025
 import streamlit as st
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+from io import BytesIO
 
-st.set_page_config(page_title="ETF Selector (Final Version)", layout="wide")
+# ============================================================
+# Page config
+# ============================================================
 
-# ------------------------------------------------------------
-# Load and clean data
-# ------------------------------------------------------------
+st.set_page_config(
+    page_title="ETF Robo-Advisor – MVO Optimizer",
+    layout="wide"
+)
+
+st.title("ETF Robo-Advisor – Portfolio Optimization (MVO + Efficient Frontier)")
+st.caption(
+    "This app uses a local ETF database (metadata, prices, returns) to filter ETFs, "
+    "construct a portfolio universe, and run Mean–Variance Optimization with an "
+    "efficient frontier and maximum Sharpe portfolio."
+)
+
+# ============================================================
+# Load local database
+# ============================================================
+
 @st.cache_data
 def load_data():
-    file_path = "ETF List.xlsx"
-    xls = pd.ExcelFile(file_path)
-    all_dfs = []
-    for sheet in xls.sheet_names:
-        df = pd.read_excel(file_path, sheet_name=sheet)
-        df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
-        df["SourceSheet"] = sheet
-        df = df.dropna(how="all")
-        df.replace(["-", "N/A", "None", "na"], np.nan, inplace=True)
-        all_dfs.append(df)
-    combined = pd.concat(all_dfs, ignore_index=True)
-    return combined, xls.sheet_names
+    # Read local Excel databases
+    meta = pd.read_excel("etf_metadata.xlsx")
+    prices = pd.read_excel("prices_1y.xlsx", index_col=0)
+    returns = pd.read_excel("returns_1y.xlsx", index_col=0)
+
+    # Ensure datetime index
+    prices.index = pd.to_datetime(prices.index)
+    returns.index = pd.to_datetime(returns.index)
+
+    # Check ticker column
+    if "YF_Ticker" not in meta.columns:
+        raise ValueError("Column 'YF_Ticker' is missing in etf_metadata.xlsx.")
+
+    # Keep only tickers that exist in all datasets
+    tickers_meta = set(meta["YF_Ticker"].dropna().astype(str))
+    tickers_prices = set(prices.columns.astype(str))
+    tickers_returns = set(returns.columns.astype(str))
+
+    valid_tickers = sorted(list(tickers_meta & tickers_prices & tickers_returns))
+
+    # Subset to valid tickers
+    prices = prices[valid_tickers]
+    returns = returns[valid_tickers]
+    meta_use = meta[meta["YF_Ticker"].isin(valid_tickers)].reset_index(drop=True)
+
+    return meta_use, prices, returns
 
 
-# ------------------------------------------------------------
-# Load dataset
-# ------------------------------------------------------------
-df, sheet_names = load_data()
-st.title("ETF Selector (Dynamic + Portfolio Builder)")
-st.caption("Dynamic filtering with multi-sheet portfolio builder and adjustable weights.")
+meta, prices, returns = load_data()
 
-# ------------------------------------------------------------
-# Step 1: Select ETF Group (sheet)
-# ------------------------------------------------------------
-st.sidebar.header("① Select ETF Group (sheet)")
-selected_sheet = st.sidebar.selectbox("Choose an ETF category:", sheet_names)
+# ============================================================
+# Step 1 – Filter ETF universe using metadata
+# ============================================================
 
-df_selected = df[df["SourceSheet"] == selected_sheet].copy()
-st.write(f"**Loaded {len(df_selected)} ETFs from '{selected_sheet}'**")
+st.header("Step 1 – Filter ETF Universe")
 
+col1, col2, col3, col4 = st.columns(4)
 
-# ------------------------------------------------------------
-# Step 2: Dynamic filter logic (UNCHANGED)
-# ------------------------------------------------------------
-filter_logic = {
-    "EM bonds": {
-        "category": ["Category", "Subcategory"],
-        "numeric": []
-    },
-    "sector ETFs": {
-        "category": [],
-        "numeric": ["1D Volume", "30D Avg Volume", "Bid Ask Spread", "Open Interest"]
-    },
-    "high yield corporate": {
-        "category": [],
-        "numeric": ["1D Volume", "Bid Ask Spread", "Short Interest%", "Open Interest"]
-    },
-    "Canadian": {
-        "category": [],
-        "numeric": ["1D Volume", "Bid Ask Spread", "Implied Liquidity"]
-    },
-    "bond etfs": {
-        "category": [],
-        "numeric": ["1D Volume", "Bid Ask Spread", "Agg Traded Val (M USD)"]
-    },
-    "thematic_strategy": {
-        "category": [],
-        "numeric": ["Fund Assets (AUM) (M USD)", "Expense Ratio", "YTD Return", "12M Yield", "YTD Flow", "Holdings"]
-    }
-}
-
-
-# ------------------------------------------------------------
-# Step 3: Display appropriate filters (UNCHANGED)
-# ------------------------------------------------------------
-st.sidebar.header("② Filter Options")
-
-logic = filter_logic.get(selected_sheet, {"category": [], "numeric": []})
-
-# Category filters
-for col in logic["category"]:
-    if col in df_selected.columns:
-        opts = df_selected[col].dropna().unique().tolist()
-        if len(opts) > 0:
-            chosen = st.sidebar.multiselect(f"{col}:", options=opts, default=opts)
-            df_selected = df_selected[df_selected[col].isin(chosen)]
-
-# Numeric sliders
-for col in logic["numeric"]:
-    if col in df_selected.columns:
-        df_selected[col] = pd.to_numeric(df_selected[col], errors="coerce")
-        valid = df_selected[col].dropna()
-        if len(valid) > 0:
-            low, high = float(valid.min()), float(valid.max())
-            low_val, high_val = st.sidebar.slider(f"{col} range", low, high, (low, high))
-            df_selected = df_selected[(df_selected[col] >= low_val) & (df_selected[col] <= high_val)]
-
-
-# ------------------------------------------------------------
-# Step 4: Display filtered results (UNCHANGED)
-# ------------------------------------------------------------
-st.subheader(f"Filtered ETFs in {selected_sheet}: {len(df_selected)}")
-st.dataframe(df_selected)
-
-
-# ------------------------------------------------------------
-# NEW PART ★ Step 5 – Portfolio Optimization (MVO + Efficient Frontier)
-# ---------------------------------------------------------------
-
-st.subheader("📊 Automatic Portfolio Optimization (Mean-Variance Model + Efficient Frontier)")
-
-st.write("Select ETFs from ANY sheet. This tool will automatically compute optimal weights, plot the efficient frontier, and find the maximum Sharpe ratio portfolio.")
-
-# Standardize names
-df["Name_Std"] = (
-    df["Name"]
-    .fillna(df.get("Security"))
-    .fillna(df.get("Description"))
-    .fillna("Unknown")
-)
-
-df["Ticker_Std"] = (
-    df["Ticker"]
-    .fillna(df.get("Security"))
-    .fillna(df.get("Description"))
-    .fillna("Unknown")
-)
-
-# Select ETFs
-all_indices = df.index.tolist()
-selected_rows = st.multiselect(
-    "Select ETFs to include in your portfolio:",
-    options=all_indices,
-)
-
-if selected_rows:
-
-    portfolio = df.loc[selected_rows, ["Name_Std", "Ticker_Std", "SourceSheet"]].copy()
-    portfolio.reset_index(drop=True, inplace=True)
-
-    st.markdown("### Step 1: Choose Risk Preference")
-    risk_choice = st.radio("Risk Level:", ["Low", "Medium", "High"])
-
-    # ---------------------------------------------------
-    # Step 2: Download Close prices
-    # ---------------------------------------------------
-    import yfinance as yf
-    import numpy as np
-    import pandas as pd
-
-    tickers = portfolio["Ticker_Std"].tolist()
-
-    st.write("Fetching 1-year daily close prices...")
-
-    try:
-        price_data = yf.download(tickers, period="1y")["Close"]
-    except:
-        st.error("Error fetching Close prices from yfinance.")
-        st.stop()
-
-    returns = price_data.pct_change().dropna()
-
-    mu = returns.mean() * 252
-    cov = returns.cov() * 252
-    rf_rate = 0.02    # risk-free rate (2%)
-
-    # ---------------------------------------------------
-    # Step 3: Mean-Variance Optimization
-    # ---------------------------------------------------
-    import cvxpy as cp
-
-    n = len(tickers)
-    w = cp.Variable(n)
-
-    if risk_choice == "Low":
-        lam = 10.0
-    elif risk_choice == "Medium":
-        lam = 3.0
+# Filter by SourceSheet (asset group)
+with col1:
+    if "SourceSheet" in meta.columns:
+        groups = sorted(meta["SourceSheet"].unique().tolist())
     else:
-        lam = 0.5
-
-    objective = cp.Maximize(mu.values @ w - lam * cp.quad_form(w, cov.values))
-
-    constraints = [
-        cp.sum(w) == 1,
-        w >= 0,
-    ]
-
-    problem = cp.Problem(objective, constraints)
-    problem.solve()
-
-    mvo_weights = np.round(w.value, 4)
-
-    portfolio["MVO_Weight"] = mvo_weights
-
-    # ---------------------------------------------------
-    # Step 4: Efficient Frontier
-    # ---------------------------------------------------
-    num_points = 50
-    frontier_returns = []
-    frontier_risk = []
-    frontier_weights = []
-
-    for t in np.linspace(0, 1, num_points):
-        w_front = cp.Variable(n)
-        objective_front = cp.Minimize(cp.quad_form(w_front, cov.values))
-        constraints_front = [
-            cp.sum(w_front) == 1,
-            w_front >= 0,
-            mu.values @ w_front == mu.min() * (1 - t) + mu.max() * t
-        ]
-        problem_front = cp.Problem(objective_front, constraints_front)
-        try:
-            problem_front.solve()
-            w_val = np.array(w_front.value).flatten()
-            frontier_weights.append(w_val)
-            frontier_returns.append(mu.values @ w_val)
-            frontier_risk.append(np.sqrt(w_val.T @ cov.values @ w_val))
-        except:
-            pass
-
-    # ---------------------------------------------------
-    # Step 5: Maximum Sharpe Ratio Portfolio
-    # ---------------------------------------------------
-    w_sharpe = cp.Variable(n)
-    objective_sharpe = cp.Maximize((mu.values @ w_sharpe - rf_rate) /
-                                   cp.sqrt(cp.quad_form(w_sharpe, cov.values)))
-
-    constraints_sharpe = [
-        cp.sum(w_sharpe) == 1,
-        w_sharpe >= 0
-    ]
-
-    problem_sharpe = cp.Problem(objective_sharpe, constraints_sharpe)
-    problem_sharpe.solve()
-
-    sharpe_weights = np.round(w_sharpe.value, 4)
-
-    portfolio["MaxSharpe_Weight"] = sharpe_weights
-
-    # ---------------------------------------------------
-    # Step 6: Final Portfolio Performance Metrics
-    # ---------------------------------------------------
-    def portfolio_stats(weights):
-        w = np.array(weights)
-        ret = mu.values @ w
-        risk = np.sqrt(w.T @ cov.values @ w)
-        sharpe = (ret - rf_rate) / risk
-        return ret, risk, sharpe
-
-    mvo_ret, mvo_risk, mvo_sharpe = portfolio_stats(mvo_weights)
-    ms_ret, ms_risk, ms_sharpe = portfolio_stats(sharpe_weights)
-
-    # ---------------------------------------------------
-    # Step 7: Visualization
-    # ---------------------------------------------------
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.scatter(frontier_risk, frontier_returns, s=10, label="Efficient Frontier")
-    ax.scatter(mvo_risk, mvo_ret, color="red", label="MVO Portfolio", s=50)
-    ax.scatter(ms_risk, ms_ret, color="green", label="Max Sharpe Portfolio", s=50)
-
-    ax.set_xlabel("Volatility (Risk)")
-    ax.set_ylabel("Expected Return")
-    ax.set_title("Efficient Frontier")
-    ax.legend()
-
-    st.pyplot(fig)
-
-    # ---------------------------------------------------
-    # Step 8: Display Results
-    # ---------------------------------------------------
-    st.markdown("### ✅ Optimized Portfolio Results")
-
-    st.write("**MVO Portfolio Performance:**")
-    st.write(f"- Annualized Return: **{mvo_ret:.4f}**")
-    st.write(f"- Annualized Volatility: **{mvo_risk:.4f}**")
-    st.write(f"- Sharpe Ratio: **{mvo_sharpe:.4f}**")
-
-    st.write("---")
-
-    st.write("**Maximum Sharpe Portfolio Performance:**")
-    st.write(f"- Annualized Return: **{ms_ret:.4f}**")
-    st.write(f"- Annualized Volatility: **{ms_risk:.4f}**")
-    st.write(f"- Sharpe Ratio: **{ms_sharpe:.4f}**")
-
-    st.write("---")
-
-    st.dataframe(portfolio)
-
-    # Download final table
-    csv = portfolio.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 Download Portfolio as CSV",
-        csv,
-        "optimized_portfolio.csv",
-        "text/csv"
+        groups = ["All"]
+    selected_groups = st.multiselect(
+        "Asset group (sheet)",
+        options=groups,
+        default=groups
     )
 
-else:
-    st.info("Select ETFs to build your optimized portfolio.")
+# Numeric filters (only applied if the column exists)
+with col2:
+    if "1D Volume" in meta.columns:
+        vol_min = st.number_input(
+            "Min 1D Volume",
+            min_value=0,
+            value=int(meta["1D Volume"].quantile(0.25))
+        )
+    else:
+        vol_min = None
+
+with col3:
+    if "Open Interest" in meta.columns:
+        oi_min = st.number_input(
+            "Min Open Interest",
+            min_value=0,
+            value=int(meta["Open Interest"].quantile(0.25))
+        )
+    else:
+        oi_min = None
+
+with col4:
+    if "Bid Ask Spread" in meta.columns:
+        bid_max = st.number_input(
+            "Max Bid-Ask Spread",
+            min_value=0.0,
+            value=float(meta["Bid Ask Spread"].quantile(0.75))
+        )
+    else:
+        bid_max = None
+
+
+# Helper: safe numeric conversion
+def safe_numeric(df, col):
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+# Apply filters
+universe = meta.copy()
+
+if "SourceSheet" in universe.columns and selected_groups:
+    universe = universe[universe["SourceSheet"].isin(selected_groups)]
+
+universe = safe_numeric(universe, "1D Volume")
+universe = safe_numeric(universe, "Open Interest")
+universe = safe_numeric(universe, "Bid Ask Spread")
+
+if vol_min is not None and "1D Volume" in universe.columns:
+    universe = universe[universe["1D Volume"] >= vol_min]
+
+if oi_min is not None and "Open Interest" in universe.columns:
+    universe = universe[universe["Open Interest"] >= oi_min]
+
+if bid_max is not None and "Bid Ask Spread" in universe.columns:
+    universe = universe[universe["Bid Ask Spread"] <= bid_max]
+
+universe = universe.reset_index(drop=True)
+
+st.write(f"Number of ETFs after filtering: **{len(universe)}**")
+
+if len(universe) == 0:
+    st.error("No ETFs passed the filters. Please loosen the filters above.")
+    st.stop()
+
+st.dataframe(
+    universe[
+        [
+            col for col in [
+                "Name", "Ticker", "YF_Ticker", "SourceSheet",
+                "1D Volume", "30D Avg Volume",
+                "Open Interest", "Bid Ask Spread"
+            ]
+            if col in universe.columns
+        ]
+    ],
+    use_container_width=True
+)
+
+# ============================================================
+# Step 2 – Select ETFs for optimization
+# ============================================================
+
+st.header("Step 2 – Select ETFs for Optimization")
+
+options = universe.index.tolist()
+labels = [
+    f"{universe.loc[i, 'YF_Ticker']} – {universe.loc[i, 'Name']}"
+    for i in options
+]
+
+selected_indices = st.multiselect(
+    "Choose ETFs to include in the optimized portfolio:",
+    options=options,
+    format_func=lambda i: labels[i]
+)
+
+if len(selected_indices) < 2:
+    st.info("Please select at least **2** ETFs to run optimization.")
+    st.stop()
+
+selected_universe = universe.loc[selected_indices].reset_index(drop=True)
+tickers_sel = selected_universe["YF_Ticker"].tolist()
+
+st.write(f"Selected ETFs ({len(tickers_sel)}): {tickers_sel}")
+
+# ============================================================
+# Step 3 – Return data for selected ETFs
+# ============================================================
+
+st.header("Step 3 – Return Data for Selected ETFs")
+
+# Subset returns matrix
+ret = returns[tickers_sel].copy()
+
+# Drop rows with all NaNs and then drop columns that become all NaN
+ret = ret.dropna(how="all")
+ret = ret.dropna(axis=1, how="all")
+
+if ret.shape[1] < 2:
+    st.error(
+        "Selected ETFs do not have enough valid return data after cleaning. "
+        "Please choose a different set of ETFs."
+    )
+    st.stop()
+
+st.write(f"Return matrix shape: {ret.shape[0]} days × {ret.shape[1]} ETFs")
+st.line_chart(ret)
+
+# ============================================================
+# Step 4 – Run Mean–Variance Optimization
+# ============================================================
+
+st.header("Step 4 – Mean–Variance Optimization (GMV & Max Sharpe)")
+
+run_opt = st.button("🚀 Run Optimization")
+
+if run_opt:
+
+    # Annualized mean and covariance
+    mu = ret.mean() * 252
+    cov = ret.cov() * 252
+
+    # Regularize covariance to avoid numerical issues
+    eps = 1e-6
+    Sigma = cov.values
+    Sigma_reg = Sigma + eps * np.eye(Sigma.shape[0])
+    Sigma_inv = np.linalg.pinv(Sigma_reg)
+
+    n = len(mu)
+    ones = np.ones(n)
+    rf = 0.02  # risk-free rate
+
+    # ---------- GMV portfolio (closed form) ----------
+    # w_gmv = Σ^{-1} 1 / (1' Σ^{-1} 1)
+    num_gmv = Sigma_inv @ ones
+    den_gmv = ones.T @ Sigma_inv @ ones
+    w_gmv = num_gmv / den_gmv
+
+    # ---------- Max Sharpe (tangency) portfolio ----------
+    # w_ms ∝ Σ^{-1} (μ - rf 1), then normalized to sum 1
+    excess = mu.values - rf * ones
+    raw_ms = Sigma_inv @ excess
+    w_ms = raw_ms / np.sum(raw_ms)
+
+    def portfolio_stats(w: np.ndarray):
+        """Compute annualized return, volatility and Sharpe."""
+        w = np.array(w)
+        p_ret = float(mu.values @ w)
+        p_vol = float(np.sqrt(w.T @ Sigma_reg @ w))
+        if p_vol > 0:
+            p_sharpe = (p_ret - rf) / p_vol
+        else:
+            p_sharpe = np.nan
+        return p_ret, p_vol, p_sharpe
+
+    g_ret, g_vol, g_sharpe = portfolio_stats(w_gmv)
+    ms_ret, ms_vol, ms_sharpe = portfolio_stats(w_ms)
+
+    # ---------- Efficient frontier (simple convex combination) ----------
+    ef_rets = []
+    ef_vols = []
+
+    for alpha in np.linspace(0.0, 1.0, 30):
+        w_ef = alpha * w_gmv + (1 - alpha) * w_ms
+        r, v, _ = portfolio_stats(w_ef)
+        ef_rets.append(r)
+        ef_vols.append(v)
+
+    # ---------- Plot efficient frontier ----------
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(ef_vols, ef_rets, "o-", markersize=3, label="Efficient frontier")
+    ax.scatter(g_vol, g_ret, color="orange", s=80, label="GMV portfolio")
+    ax.scatter(ms_vol, ms_ret, color="green", s=80, label="Max Sharpe portfolio")
+    ax.set_xlabel("Volatility (σ)")
+    ax.set_ylabel("Expected annual return (μ)")
+    ax.legend()
+    st.pyplot(fig)
+
+    # ============================================================
+    # Step 5 – Output final portfolio summary
+    # ============================================================
+
+    st.header("Step 5 – Portfolio Output Summary")
+
+    # Weights table
+    weights_df = pd.DataFrame({
+        "ETF": tickers_sel,
+        "GMV Weight": w_gmv,
+        "Max Sharpe Weight": w_ms
+    })
+
+    # Normalize again to avoid tiny numerical drift
+    for col in ["GMV Weight", "Max Sharpe Weight"]:
+        total = weights_df[col].sum()
+        if total != 0:
+            weights_df[col] = weights_df[col] / total
+
+    st.subheader("Final Portfolio Weights")
+    st.dataframe(weights_df, use_container_width=True)
+
+    # Performance summary
+    summary_df = pd.DataFrame({
+        "Portfolio": ["GMV", "Max Sharpe"],
+        "Annual Return": [g_ret, ms_ret],
+        "Annual Volatility": [g_vol, ms_vol],
+        "Sharpe Ratio": [g_sharpe, ms_sharpe]
+    })
+
+    st.subheader("Performance Summary")
+    st.dataframe(summary_df, use_container_width=True)
+
+    # Download weights as Excel
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        weights_df.to_excel(writer, sheet_name="weights", index=False)
+        summary_df.to_excel(writer, sheet_name="summary", index=False)
+
+    st.download_button(
+        label="📥 Download Optimized Portfolio (Excel)",
+        data=buffer.getvalue(),
+        file_name="optimized_portfolio.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        )
+    )
+
 
