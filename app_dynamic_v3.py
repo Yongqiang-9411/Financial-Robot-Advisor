@@ -112,13 +112,14 @@ st.dataframe(df_selected)
 
 
 # ------------------------------------------------------------
-# NEW PART ⭐ Step 5 — Portfolio Builder (CROSS-SHEET + WEIGHTS)
-# ------------------------------------------------------------
-st.subheader("③ Build Your Portfolio")
+# NEW PART ★ Step 5 – Portfolio Optimization (MVO + Efficient Frontier)
+# ---------------------------------------------------------------
 
-st.write("You can select **any ETFs from ANY sheet**, regardless of current filters.")
+st.subheader("📊 Automatic Portfolio Optimization (Mean-Variance Model + Efficient Frontier)")
 
-# Standardize names to avoid None values
+st.write("Select ETFs from ANY sheet. This tool will automatically compute optimal weights, plot the efficient frontier, and find the maximum Sharpe ratio portfolio.")
+
+# Standardize names
 df["Name_Std"] = (
     df["Name"]
     .fillna(df.get("Security"))
@@ -133,46 +134,178 @@ df["Ticker_Std"] = (
     .fillna("Unknown")
 )
 
-# Allow user to select ANY ETF across all sheets
+# Select ETFs
 all_indices = df.index.tolist()
-selected_portfolio_rows = st.multiselect(
-    "Select ETFs to include in your portfolio (cross-sheet supported):",
+selected_rows = st.multiselect(
+    "Select ETFs to include in your portfolio:",
     options=all_indices,
 )
 
-if selected_portfolio_rows:
-    portfolio = df.loc[selected_portfolio_rows, ["Name_Std", "Ticker_Std", "SourceSheet"]].copy()
+if selected_rows:
+
+    portfolio = df.loc[selected_rows, ["Name_Std", "Ticker_Std", "SourceSheet"]].copy()
     portfolio.reset_index(drop=True, inplace=True)
 
-    st.markdown("### 🔧 Adjust ETF Weights")
+    st.markdown("### Step 1: Choose Risk Preference")
+    risk_choice = st.radio("Risk Level:", ["Low", "Medium", "High"])
 
-    total_weight = 0
-    weight_list = []
+    # ---------------------------------------------------
+    # Step 2: Download Close prices
+    # ---------------------------------------------------
+    import yfinance as yf
+    import numpy as np
+    import pandas as pd
 
-    # Weight input for each ETF
-    for i in range(len(portfolio)):
-        default_w = round(1 / len(portfolio), 2)
-        w = st.number_input(
-            f"Weight for {portfolio.loc[i, 'Name_Std']} (0-1):",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(default_w),
-            step=0.05,
-            key=f"weight_{i}"
-        )
-        weight_list.append(w)
-        total_weight += w
+    tickers = portfolio["Ticker_Std"].tolist()
 
-    # Normalize weights so total = 1
-    portfolio["Weight"] = [w / total_weight for w in weight_list] if total_weight > 0 else 0
+    st.write("Fetching 1-year daily close prices...")
 
-    st.markdown("### 📊 Your Final Portfolio")
+    try:
+        price_data = yf.download(tickers, period="1y")["Close"]
+    except:
+        st.error("Error fetching Close prices from yfinance.")
+        st.stop()
+
+    returns = price_data.pct_change().dropna()
+
+    mu = returns.mean() * 252
+    cov = returns.cov() * 252
+    rf_rate = 0.02    # risk-free rate (2%)
+
+    # ---------------------------------------------------
+    # Step 3: Mean-Variance Optimization
+    # ---------------------------------------------------
+    import cvxpy as cp
+
+    n = len(tickers)
+    w = cp.Variable(n)
+
+    if risk_choice == "Low":
+        lam = 10.0
+    elif risk_choice == "Medium":
+        lam = 3.0
+    else:
+        lam = 0.5
+
+    objective = cp.Maximize(mu.values @ w - lam * cp.quad_form(w, cov.values))
+
+    constraints = [
+        cp.sum(w) == 1,
+        w >= 0,
+    ]
+
+    problem = cp.Problem(objective, constraints)
+    problem.solve()
+
+    mvo_weights = np.round(w.value, 4)
+
+    portfolio["MVO_Weight"] = mvo_weights
+
+    # ---------------------------------------------------
+    # Step 4: Efficient Frontier
+    # ---------------------------------------------------
+    num_points = 50
+    frontier_returns = []
+    frontier_risk = []
+    frontier_weights = []
+
+    for t in np.linspace(0, 1, num_points):
+        w_front = cp.Variable(n)
+        objective_front = cp.Minimize(cp.quad_form(w_front, cov.values))
+        constraints_front = [
+            cp.sum(w_front) == 1,
+            w_front >= 0,
+            mu.values @ w_front == mu.min() * (1 - t) + mu.max() * t
+        ]
+        problem_front = cp.Problem(objective_front, constraints_front)
+        try:
+            problem_front.solve()
+            w_val = np.array(w_front.value).flatten()
+            frontier_weights.append(w_val)
+            frontier_returns.append(mu.values @ w_val)
+            frontier_risk.append(np.sqrt(w_val.T @ cov.values @ w_val))
+        except:
+            pass
+
+    # ---------------------------------------------------
+    # Step 5: Maximum Sharpe Ratio Portfolio
+    # ---------------------------------------------------
+    w_sharpe = cp.Variable(n)
+    objective_sharpe = cp.Maximize((mu.values @ w_sharpe - rf_rate) /
+                                   cp.sqrt(cp.quad_form(w_sharpe, cov.values)))
+
+    constraints_sharpe = [
+        cp.sum(w_sharpe) == 1,
+        w_sharpe >= 0
+    ]
+
+    problem_sharpe = cp.Problem(objective_sharpe, constraints_sharpe)
+    problem_sharpe.solve()
+
+    sharpe_weights = np.round(w_sharpe.value, 4)
+
+    portfolio["MaxSharpe_Weight"] = sharpe_weights
+
+    # ---------------------------------------------------
+    # Step 6: Final Portfolio Performance Metrics
+    # ---------------------------------------------------
+    def portfolio_stats(weights):
+        w = np.array(weights)
+        ret = mu.values @ w
+        risk = np.sqrt(w.T @ cov.values @ w)
+        sharpe = (ret - rf_rate) / risk
+        return ret, risk, sharpe
+
+    mvo_ret, mvo_risk, mvo_sharpe = portfolio_stats(mvo_weights)
+    ms_ret, ms_risk, ms_sharpe = portfolio_stats(sharpe_weights)
+
+    # ---------------------------------------------------
+    # Step 7: Visualization
+    # ---------------------------------------------------
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(frontier_risk, frontier_returns, s=10, label="Efficient Frontier")
+    ax.scatter(mvo_risk, mvo_ret, color="red", label="MVO Portfolio", s=50)
+    ax.scatter(ms_risk, ms_ret, color="green", label="Max Sharpe Portfolio", s=50)
+
+    ax.set_xlabel("Volatility (Risk)")
+    ax.set_ylabel("Expected Return")
+    ax.set_title("Efficient Frontier")
+    ax.legend()
+
+    st.pyplot(fig)
+
+    # ---------------------------------------------------
+    # Step 8: Display Results
+    # ---------------------------------------------------
+    st.markdown("### ✅ Optimized Portfolio Results")
+
+    st.write("**MVO Portfolio Performance:**")
+    st.write(f"- Annualized Return: **{mvo_ret:.4f}**")
+    st.write(f"- Annualized Volatility: **{mvo_risk:.4f}**")
+    st.write(f"- Sharpe Ratio: **{mvo_sharpe:.4f}**")
+
+    st.write("---")
+
+    st.write("**Maximum Sharpe Portfolio Performance:**")
+    st.write(f"- Annualized Return: **{ms_ret:.4f}**")
+    st.write(f"- Annualized Volatility: **{ms_risk:.4f}**")
+    st.write(f"- Sharpe Ratio: **{ms_sharpe:.4f}**")
+
+    st.write("---")
+
     st.dataframe(portfolio)
 
-    # Download
+    # Download final table
     csv = portfolio.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download Portfolio as CSV", csv, "portfolio.csv", "text/csv")
+    st.download_button(
+        "📥 Download Portfolio as CSV",
+        csv,
+        "optimized_portfolio.csv",
+        "text/csv"
+    )
 
 else:
-    st.info("Select ETFs to build your portfolio.")
+    st.info("Select ETFs to build your optimized portfolio.")
 
